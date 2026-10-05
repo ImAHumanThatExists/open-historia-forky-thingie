@@ -219,19 +219,21 @@ Two Cloudflare Workers deploy alongside the site so merged worker code can never
 
 ## 7. Cloudflare Workers (the control/edge plane)
 
-### 7.1 Import counter — `tools/import-counter/`
+### 7.1 Import counter — `tools/import-counter/` (retired)
 
-A tiny Worker that counts community-scenario imports. The game server pings it once per successful install via `server/server.js` → `/api/hub/import-log` (`server/server.js:657`), giving real numbers even for scenarios GitHub can't count (issue attachments).
+A scenario's import count is how many times its file has been downloaded from the community hub's **releases**, as GitHub counts it. The hub repository's *Copy post files to releases* workflow copies each post's attachment into a release, adds the downloads up every half hour, and writes them (with where each copy is) to `index.json` on its `hub-index` branch. Builds of the game with `src/runtime/hubFiles.js` read that file from `raw.githubusercontent.com` and download a post's file from the release; this branch's game does not have it yet: it still downloads the post's own attachment, asks this Worker for the counts (`/api/hub/import-counts`) and reports each import to it (`/api/hub/import-log`).
+
+Until 2026-10-05 the Worker kept the counts in KV. One KV `list()` per read of `/counts` and a write per import spent the free plan's daily KV allowance within hours of every day, after which nobody saw any counts. It now answers from the hub's index and stores nothing (`worker.js`; `server/importCounterWorker.test.js`):
 
 | Item | Value |
 |---|---|
 | Worker name | `oh-import-counter` (`tools/import-counter/wrangler.toml`) |
-| Entry | `worker.js` |
-| Storage | KV binding `IMPORTS` (counts live in each key's metadata so `/counts` is one list call) |
-| Default URL baked into the app | `https://oh-import-counter.nichojkrol.workers.dev` (`server/server.js:654`) |
-| Override | `OH_IMPORT_COUNTER_URL` env on the game server |
-| Dedup | Website: once per **account _and_ IP** (skip if either seen); app/anonymous web: once per **IP**. Raw IPs never stored — hashed with `HASH_SALT` |
-| Read routes | `/counts` (all), `/count/<hub-issue-number>` (one) |
+| Default URL baked into the app | `https://oh-import-counter.nichojkrol.workers.dev` (`server/server.js`, `OH_IMPORT_COUNTER_URL` overrides it) |
+| `GET /counts`, `GET /count/<post>` | The hub index's counts, in the shapes the game reads; the index is kept five minutes at the edge |
+| `POST /hit` | Accepted and ignored. An import made by a build that downloads the attachment is therefore not counted; one made by a build that downloads the release copy is counted by GitHub |
+| Storage | None. The `IMPORTS` KV binding is unused and can be removed with the namespace; what it had counted is carried in the hub's numbers (`data/legacy-import-counts.json` there) |
+
+It takes effect when the site is next deployed from the admin panel (§6.1).
 
 ### 7.2 Node registry — `open-historia-admin/registry/`
 
@@ -307,7 +309,7 @@ It reads only from `server/seed/default`, which **is** committed (map included) 
 | **Android (stable)** | `main` | `open-historia.apk` on `android` | `android-apk.yml` (dispatch from `main` / `android-v*` tag) | Install once; the app self-updates from `android/latest.json` |
 | **Android (beta)** | `beta` | `open-historia-beta.apk` on `android-beta` | `android-apk-beta.yml` (dispatch from `beta` / `android-beta-v*` tag) | Install from the pre-release, beside the stable app; self-updates from `android-beta/latest.json` |
 | **Website** | `main` | `dist-site/` | Admin-panel 🚀 button → clean `upstream/main` worktree → `build:site` → `wrangler pages deploy` (or legacy `deploy-site.yml`) | Nothing — next page load |
-| **Import counter Worker** | `main` | `tools/import-counter/worker.js` | Rides the admin-panel site deploy from the same worktree | — |
+| **Import counter Worker** (retired, §7.1) | `main` | `tools/import-counter/worker.js` | Rides the admin-panel site deploy from the same worktree | — |
 | **Registry Worker** | admin repo | `registry/worker.js` | Rides the site deploy from the admin repo dir | — |
 | **Node directory** | *runtime data* | signed JSON | Admin panel re-signs + POSTs to the registry on any node change | Live, no rebuild |
 | **Map binaries** | *manual* | Release assets | Uploaded to `map-data`; fetched by `fetch-map-assets.mjs` at launch/update/bundle | Downloaded on first run |
@@ -318,6 +320,19 @@ Key asymmetries a newcomer should internalize:
 - **`alpha` ships nothing on its own** — it reaches users only once bridged into `beta`/`main`.
 - **Worker code and website move together** through the admin-panel deploy engine, precisely to stop merged worker code from sitting undeployed.
 - **Map data is decoupled from code** — a code release does not re-cut the map; a map change is a manual Release upload + manifest edit.
+
+### 11.1 How an installed desktop game updates
+
+Opening the game installs a waiting update; the update banner (`src/runtime/AppUpdateBanner.jsx`) is for an update found while the game is already open.
+
+- **As the game opens** (Windows, Linux): `electron/launchUpdate.cjs`, from `boot()` in `electron/main.cjs` before the map check and the server: `checkForUpdates` against the release's `latest*.yml`, capped at 6 s. Nothing newer, offline or slow: no window, the game opens. An update: the setup window shows "Updating Open Historia" with its progress, then `quitAndInstall(true, true)` (silent, reopens on the new version). **Open the game now** opens the game at once; the download carries on and installs when the game is closed (`autoInstallOnAppQuit`), and the banner shows how far it got.
+- **The beta offer:** the stable app's update screen also offers **Download the beta** (`betaOffer`, `setup:open-beta`): the beta's Windows installer, or its release page on other systems, opened in the player's browser while the update goes on. The beta is a separate app with its own saves, and its own update screen makes no such offer.
+- **A version that fails to download at launch twice** is left to the banner (`launch-update.json` in the app's user-data folder); a newer version starts again from zero.
+- **While it is open:** the banner. **Update now** downloads, **Restart now** installs.
+- **Downloads are always full** (`disableDifferentialDownload`): every installer is published under one fixed name on a rolling release, so the old block map electron-updater would compare against is the new one.
+- **macOS:** nothing at launch (Squirrel.Mac needs a signed app, and the build is unsigned); the banner links to the new zip.
+
+Tests: `server/launchUpdate.test.js`.
 
 ---
 
