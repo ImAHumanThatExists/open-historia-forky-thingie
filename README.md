@@ -23,7 +23,7 @@ Contributions are accepted under the [Contributor Copyright Assignment Agreement
   </a>
   <!-- Ko-Fi -->
   <a href="https://ko-fi.com/openhistoria">
-    <img src="https://storage.ko-fi.com/cdn/logomarkLogo.png"
+    <img src="https://storage.ko-fi.com/cdn/logomarkLogo.png?style=flat-square&logo=ko-fi&logoColor=white"
       alt="Kofi" />
   <!-- License -->
   <a href="LICENSE">
