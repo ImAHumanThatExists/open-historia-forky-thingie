@@ -14,6 +14,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 const net = require("node:net");
 const { spawn } = require("node:child_process");
+const { runLaunchUpdate } = require("./launchUpdate.cjs");
 
 // Which build this is. scripts/stamp-channel.mjs writes electron/channel.json for
 // the beta build (`npm run dist:win:beta` and the beta release workflow); the
@@ -61,6 +62,14 @@ if (IS_BETA) app.setName(BETA_APP_NAME);
 // server/betaPackaging.test.js is what keeps the two honest.
 const BETA_UPDATE_MANIFEST =
   "https://github.com/Open-Historia/open-historia/releases/download/desktop-beta/latest.json";
+
+// Where the stable app's update screen sends a player who wants the beta: the
+// Windows installer itself, and elsewhere the release page, which lists the
+// builds for each system. The beta installs beside the stable app, as its own
+// application with its own saves (see above), so trying it risks nothing.
+const BETA_DOWNLOAD_URL = process.platform === "win32"
+  ? "https://github.com/Open-Historia/open-historia/releases/download/desktop-beta/Open-Historia-Beta-Setup.exe"
+  : "https://github.com/Open-Historia/open-historia/releases/tag/desktop-beta";
 
 // Everything the app writes lives under Electron's per-user data directory.
 // Program Files is read-only for a normal user and the app bundle is read-only
@@ -219,9 +228,18 @@ const setupAutoUpdater = () => {
     warn: (message) => logMain("warn", "updater", message),
     error: (message) => logMain("error", "updater", message),
   };
-  // The banner decides when to download — a player on a metered connection
-  // should not have ~100MB pulled out from under them by opening the game.
+  // Nothing downloads on its own. Opening the game downloads and installs a
+  // waiting update with a progress bar and a button to open the game now
+  // (electron/launchUpdate.cjs, from boot()); one found while the game is open
+  // waits for the banner's button — ~100MB is not pulled out from under a player
+  // mid-session on a metered connection.
   autoUpdater.autoDownload = false;
+  // Every installer is published under one fixed name on a rolling release, so
+  // the "old" block map electron-updater fetches for a differential download is
+  // the new one: it concludes nothing changed, assembles the old installer
+  // again, fails the checksum and only then downloads in full. Go straight to
+  // the full download.
+  autoUpdater.disableDifferentialDownload = true;
   // If they download but never press Restart, it installs on the next quit
   // instead of being thrown away.
   autoUpdater.autoInstallOnAppQuit = true;
@@ -240,9 +258,11 @@ const setupAutoUpdater = () => {
 // Published on globalThis for server.js, which is imported into THIS process and
 // serves /api/app-update/{status,download,restart} straight off it. Called from
 // boot() before the server starts, so the routes are never live without it.
+// Returns the updater (null where the app cannot update itself) for the launch
+// check in boot().
 const installAutoUpdater = () => {
   const autoUpdater = setupAutoUpdater();
-  if (!autoUpdater) return;
+  if (!autoUpdater) return null;
   globalThis.__ohAutoUpdate = {
     status: () => updateState,
     download: () => {
@@ -287,6 +307,7 @@ const installAutoUpdater = () => {
     // quitAndInstall tears the process down immediately.
     restart: () => { setTimeout(() => autoUpdater.quitAndInstall(true, true), 400); },
   };
+  return autoUpdater;
 };
 
 const APP_ROOT = path.join(__dirname, "..");
@@ -399,13 +420,36 @@ const verifyMapData = () => {
 const createSetupWindow = () =>
   new BrowserWindow({
     width: 560,
-    height: 320,
+    // Tall enough for the update screen with both of its offers (open the game
+    // now, download the beta) without scrolling.
+    height: 470,
     resizable: false,
     // No menu bar, no dev chrome — this is a setup dialog, not a browser.
     autoHideMenuBar: true,
     backgroundColor: "#131315",
     show: false,
     webPreferences: { preload: path.join(__dirname, "preload.cjs") },
+  });
+
+// The fetcher keeps printing progress after a player closes the setup window
+// (which quits the app), and a destroyed window throws on every send.
+const sendToSetup = (channel, payload) => {
+  if (setupWindow && !setupWindow.isDestroyed()) setupWindow.webContents.send(channel, payload);
+};
+
+// One setup window for everything shown before the game: an update installing at
+// launch, then the map download if one is needed.
+const openSetupWindow = async () => {
+  if (setupWindow) return;
+  setupWindow = createSetupWindow();
+  await setupWindow.loadFile(path.join(__dirname, "setup.html"));
+  setupWindow.show();
+};
+
+// "Open the game now" while an update downloads at launch.
+const waitForUpdateLater = () =>
+  new Promise((resolve) => {
+    ipcMain.handleOnce("setup:update-later", () => resolve());
   });
 
 // Electron builds NO context menu on its own — a right-click just does
@@ -629,13 +673,31 @@ const startServer = async () => {
 };
 
 const boot = async () => {
-  installAutoUpdater();
+  const updater = installAutoUpdater();
+  // Opening the game installs a waiting update before anything else starts
+  // (electron/launchUpdate.cjs); the banner is for one found while it is open.
+  // Nothing here may stop the game opening: any failure opens it as before.
+  const launchUpdate = await runLaunchUpdate({
+    updater,
+    fs,
+    recordFile: path.join(USER_ROOT, "launch-update.json"),
+    showWindow: openSetupWindow,
+    // The stable app's update screen also offers the beta (setup.html); the
+    // beta has nothing newer to offer.
+    send: (payload) => sendToSetup("setup:update", { ...payload, betaOffer: !IS_BETA }),
+    waitForLater: waitForUpdateLater,
+    log: logMain,
+  }).catch((error) => {
+    logMain("warn", "updater.launchFailed", String(error?.message || error));
+    return { installing: false };
+  });
+  ipcMain.removeHandler("setup:update-later");
+  // Quitting into the installer, which reopens the game on the new version.
+  if (launchUpdate.installing) return;
   relocateLegacyStockMap();
   const pending = missingAssets();
   if (pending.length) {
-    setupWindow = createSetupWindow();
-    await setupWindow.loadFile(path.join(__dirname, "setup.html"));
-    setupWindow.show();
+    await openSetupWindow();
     const totalBytes = pending.reduce((sum, asset) => sum + asset.bytes, 0);
     let doneBytes = 0;
     let currentAsset = "";
@@ -644,14 +706,14 @@ const boot = async () => {
         if (currentAsset) doneBytes += pending.find((a) => a.asset === currentAsset)?.bytes ?? 0;
         currentAsset = asset;
       }
-      setupWindow?.webContents.send("setup:progress", {
+      sendToSetup("setup:progress", {
         asset,
         received: doneBytes + received,
         total: totalBytes,
         assetTotal: total,
       });
     });
-    setupWindow?.webContents.send("setup:done");
+    sendToSetup("setup:done");
   }
 
   await startServer();
@@ -703,4 +765,8 @@ if (!app.requestSingleInstanceLock()) {
     quitting = true;
   });
   ipcMain.handle("setup:cancel", () => app.quit());
+  // "Download the beta" on the update screen: in the player's own browser, so
+  // the download is where they can see it. Nothing about this launch changes:
+  // the update goes on installing.
+  ipcMain.handle("setup:open-beta", () => shell.openExternal(BETA_DOWNLOAD_URL));
 }
